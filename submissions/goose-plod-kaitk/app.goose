@@ -26,8 +26,12 @@ import sqlite;
 enum Use { None, Written, Held }
 
 // A write's transaction, and its answer, kept in App's answers until the
-// COMMIT; asker, for the write whose WAKE began a hold.
-struct St { use: Use = Use.None, gen: i64 = 0, status: i32 = 0, at: i64 = 0, len: i64 = 0, asker: bool = false }
+// COMMIT. A parked write: whether it began the hold, its user, and the post
+// it likes, or for a new post its text and author name, kept in App's held.
+struct St {
+    use: Use = Use.None, gen: i64 = 0, status: i32 = 0, at: i64 = 0, len: i64 = 0,
+    asker: bool = false, user: i64 = 0, post: i64 = 0, name_len: i64 = 0,
+}
 
 // The worker state: its connection, the key tokens are signed with, and the
 // checkpoint lane with the writes since it was last asked. The open
@@ -51,16 +55,19 @@ struct App {
     holding: bool = false,
     hold_until_ns: i64 = 0,
     parked: http::MailAddress[..4096] = [],
+    held: u8[..65536] = "",
 }
 
 // A write adds about 4 pages to the WAL: the lane is asked to copy it back
 // at about 4,096.
 let CHECKPOINT_WRITES = 1024;
 
-// Past HOLD_WRITES writes since the WAL last started over, a pass's COMMIT
-// waits, at most HOLD_MS, for a checkpoint the lane runs with no commits
-// arriving, which completes, so that the next COMMIT starts the WAL over.
-// HOLD is the lane's tag for that checkpoint.
+// Past HOLD_WRITES writes since the WAL last started over, the open
+// transaction commits, and writes park, at most HOLD_MS, before they write,
+// while the lane runs a checkpoint that completes with no commits arriving.
+// The first transaction after it then starts the WAL over: SQLite restarts
+// the WAL only for a writer whose transaction began once the WAL had been
+// copied back whole. HOLD is the lane's tag for that checkpoint.
 let HOLD_WRITES = 4096;
 let HOLD_MS = 250;
 let HOLD: i32 = 1;
@@ -137,53 +144,63 @@ fn settle(cx, gen: i64) {
 
 fn resume(u: Use.None, cx) { plod::fail(cx, 500, "internal server error"); }
 
-// At the pass's end, the write's transaction commits, unless a hold parks
-// it. Every event settles it, so that a client that goes leaves none open.
-fn resume(u: Use.Written, cx) {
-    if cx.kind == http::WAKE && held(cx) { return; }
-    finish(cx);
-}
+// At the pass's end, the write's transaction commits. Every event settles
+// it, so that a client that goes leaves none open.
+fn resume(u: Use.Written, cx) { finish(cx); }
 
 // A parked write: the lane's reply to the asker, or a TIMEOUT, ends the
-// hold and wakes the rest. Another write's client that goes during the hold
-// leaves its transaction to them.
+// hold and wakes the rest; then the write runs.
 fn resume(u: Use.Held, cx) {
-    if cx.state.asker || cx.kind == http::TIMEOUT {
-        release(cx);
-    } else if cx.kind == http::CLOSED && cx.app.holding {
-        cx.app.unanswered--;
+    if cx.state.asker || cx.kind == http::TIMEOUT { release(cx); }
+    guard cx.kind != http::CLOSED else { return; }
+    if cx.state.post > 0 {
+        liked(cx, cx.state.user, cx.state.post);
         return;
     }
-    finish(cx);
+    let end = cx.state.at + cx.state.len;
+    var text: u8[>..] = [];
+    var name: u8[>..] = [];
+    text.append(cx.app.held[cx.state.at..end]);
+    name.append(cx.app.held[end..end + cx.state.name_len]);
+    posted(cx, cx.state.user, text, name);
 }
 
-// Parks the write until the hold ends: the first past HOLD_WRITES asks the
-// lane for a checkpoint, with its own address for the reply, and the rest
-// park behind it. False, and the transaction commits now, once it has, or
-// when the lane's box or the parked writes are full.
-fn held(cx) -> bool {
-    guard cx.app.open && cx.app.gen == cx.state.gen else { return false; }
+// Parks a write, a like of post or a new post's text and author's name,
+// until the hold ends: the first past HOLD_WRITES commits the open
+// transaction and asks the lane for a checkpoint, with its own address for
+// the reply, and the rest park behind it. False, and the write runs now,
+// when the lane's box, the parked writes, or held are full.
+fn parks(cx, user: i64, post: i64, text: const u8[:], name: const u8[:]) -> bool {
     let now = time_ns();
     if !cx.app.holding {
         guard cx.app.since >= HOLD_WRITES else { return false; }
-        // An answer written after later doesn't wait.
+        settle(cx, cx.app.gen);
+        plod::own_waits(cx, Use.Held);
+        // A write that runs after this later doesn't wait for it.
         let to = http::later(cx.out, HOLD_MS);
         guard http::lane_send_value(cx.app.checkpoints, HOLD, to) == http::SENT else { return false; }
         cx.app.holding = true;
         cx.app.hold_until_ns = now + HOLD_MS * 1000000;
+        cx.app.held.clear();
         cx.state.asker = true;
-        cx.state.use = Use.Held;
-        return true;
+    } else {
+        guard cx.app.parked.len < cx.app.parked.cap && now < cx.app.hold_until_ns else { return false; }
+        guard cx.app.held.len + text.len + name.len <= cx.app.held.cap else { return false; }
+        plod::own_waits(cx, Use.Held);
+        cx.app.parked.push(http::later(cx.out, max((cx.app.hold_until_ns - now) / 1000000, 1)));
     }
-    guard cx.app.parked.len < cx.app.parked.cap && now < cx.app.hold_until_ns else { return false; }
-    cx.app.parked.push(http::later(cx.out, max((cx.app.hold_until_ns - now) / 1000000, 1)));
-    cx.state.use = Use.Held;
+    cx.state.user = user;
+    cx.state.post = post;
+    cx.state.at = cx.app.held.len;
+    cx.state.len = text.len;
+    cx.state.name_len = name.len;
+    cx.app.held.append(text);
+    cx.app.held.append(name);
     return true;
 }
 
-// Ends the hold, and wakes the writes parked in it. The WAL starts over at
-// the next COMMIT when the checkpoint completed; when it didn't, the
-// worker's own checkpoint at 65,536 pages bounds it.
+// Ends the hold, and wakes the writes parked in it. When the checkpoint
+// didn't complete in time, the worker's own at 65,536 pages bounds the WAL.
 fn release(cx) {
     guard cx.app.holding else { return; }
     cx.app.holding = false;
@@ -331,6 +348,16 @@ fn show(cx, id: i64) {
 fn create(cx, user: i64, name: const u8[:]) {
     var text: u8[>..] = [];
     post_body(cx, text);
+    guard !parks(cx, user, 0, text, name) else { return; }
+    posted(cx, user, text, name);
+}
+
+fn like(cx, user: i64, id: i64) {
+    guard !parks(cx, user, id, "", "") else { return; }
+    liked(cx, user, id);
+}
+
+fn posted(cx, user: i64, text: const u8[:], name: const u8[:]) {
     var out: u8[>..] = [];
     write(cx) {
         sqlite::query(cx.app.db, INSERT_POST, user, text) { r =>
@@ -350,7 +377,7 @@ fn create(cx, user: i64, name: const u8[:]) {
 
 // A like that changes nothing, a repeat or a post that isn't there, ends a
 // transaction it began itself, and is answered at once.
-fn like(cx, user: i64, id: i64) {
+fn liked(cx, user: i64, id: i64) {
     var added = 0;
     var exists = 0;
     write(cx) {
