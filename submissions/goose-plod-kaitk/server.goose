@@ -5,7 +5,7 @@ import std;
 import os;
 import http from "github.com/kaitk/goose-http@v0.5.20";
 import hash from "github.com/kaitk/goose-hash@v0.0.4";
-import plod from "github.com/kaitk/plod@group-commit";
+import plod from "github.com/kaitk/plod@v0.5.13";
 import sqlite from "github.com/kaitk/goose-sqlite@v0.0.4";
 import app;
 
