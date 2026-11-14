@@ -23,17 +23,18 @@ import plod;
 import plod.jwt;
 import sqlite;
 
-enum Use { None, Written }
+enum Use { None, Written, Held }
 
 // A write's transaction, and its answer, kept in App's answers until the
-// COMMIT.
-struct St { use: Use = Use.None, gen: i64 = 0, status: i32 = 0, at: i64 = 0, len: i64 = 0 }
+// COMMIT; asker, for the write whose WAKE began a hold.
+struct St { use: Use = Use.None, gen: i64 = 0, status: i32 = 0, at: i64 = 0, len: i64 = 0, asker: bool = false }
 
 // The worker state: its connection, the key tokens are signed with, and the
 // checkpoint lane with the writes since it was last asked. The open
 // transaction: its generation, the writes that joined it, and the answers
 // of the writes not yet answered; failed is the last generation whose COMMIT
-// failed.
+// failed. A hold: the writes since the WAL last started over, whether a
+// hold is on and until when, and the writes parked in it.
 struct App {
     db: sqlite::Conn&,
     keys: const plod::JwtKey[:],
@@ -46,15 +47,28 @@ struct App {
     joined: i64 = 0,
     unanswered: i64 = 0,
     failed: i64 = -1,
+    since: i64 = 0,
+    holding: bool = false,
+    hold_until_ns: i64 = 0,
+    parked: http::MailAddress[..4096] = [],
 }
 
 // A write adds about 4 pages to the WAL: the lane is asked to copy it back
 // at about 4,096.
 let CHECKPOINT_WRITES = 1024;
 
+// Past HOLD_WRITES writes since the WAL last started over, a pass's COMMIT
+// waits, at most HOLD_MS, for a checkpoint the lane runs with no commits
+// arriving, which completes, so that the next COMMIT starts the WAL over.
+// HOLD is the lane's tag for that checkpoint.
+let HOLD_WRITES = 4096;
+let HOLD_MS = 250;
+let HOLD: i32 = 1;
+
 // Counts a write that changed the database, and asks the lane for a
 // checkpoint once enough have; while its box is full, the next write asks.
 fn wrote(cx) {
+    cx.app.since++;
     cx.app.writes++;
     if cx.app.writes >= CHECKPOINT_WRITES && http::lane_send(cx.app.checkpoints, 0, "") == http::SENT {
         cx.app.writes = 0;
@@ -123,9 +137,63 @@ fn settle(cx, gen: i64) {
 
 fn resume(u: Use.None, cx) { plod::fail(cx, 500, "internal server error"); }
 
-// Every event settles the write's transaction, so that a client that goes
-// leaves none open; the WAKE and TIMEOUT answer it.
+// At the pass's end, the write's transaction commits, unless a hold parks
+// it. Every event settles it, so that a client that goes leaves none open.
 fn resume(u: Use.Written, cx) {
+    if cx.kind == http::WAKE && held(cx) { return; }
+    finish(cx);
+}
+
+// A parked write: the lane's reply to the asker, or a TIMEOUT, ends the
+// hold and wakes the rest. Another write's client that goes during the hold
+// leaves its transaction to them.
+fn resume(u: Use.Held, cx) {
+    if cx.state.asker || cx.kind == http::TIMEOUT {
+        release(cx);
+    } else if cx.kind == http::CLOSED && cx.app.holding {
+        cx.app.unanswered--;
+        return;
+    }
+    finish(cx);
+}
+
+// Parks the write until the hold ends: the first past HOLD_WRITES asks the
+// lane for a checkpoint, with its own address for the reply, and the rest
+// park behind it. False, and the transaction commits now, once it has, or
+// when the lane's box or the parked writes are full.
+fn held(cx) -> bool {
+    guard cx.app.open && cx.app.gen == cx.state.gen else { return false; }
+    let now = time_ns();
+    if !cx.app.holding {
+        guard cx.app.since >= HOLD_WRITES else { return false; }
+        // An answer written after later doesn't wait.
+        let to = http::later(cx.out, HOLD_MS);
+        guard http::lane_send_value(cx.app.checkpoints, HOLD, to) == http::SENT else { return false; }
+        cx.app.holding = true;
+        cx.app.hold_until_ns = now + HOLD_MS * 1000000;
+        cx.state.asker = true;
+        cx.state.use = Use.Held;
+        return true;
+    }
+    guard cx.app.parked.len < cx.app.parked.cap && now < cx.app.hold_until_ns else { return false; }
+    cx.app.parked.push(http::later(cx.out, max((cx.app.hold_until_ns - now) / 1000000, 1)));
+    cx.state.use = Use.Held;
+    return true;
+}
+
+// Ends the hold, and wakes the writes parked in it. The WAL starts over at
+// the next COMMIT when the checkpoint completed; when it didn't, the
+// worker's own checkpoint at 65,536 pages bounds it.
+fn release(cx) {
+    guard cx.app.holding else { return; }
+    cx.app.holding = false;
+    cx.app.since = 0;
+    for to in cx.app.parked { http::wake(to, 0); }
+    cx.app.parked.clear();
+}
+
+// Settles the write's transaction, and answers it, unless its client went.
+fn finish(cx) {
     settle(cx, cx.state.gen);
     cx.app.unanswered--;
     guard cx.kind != http::CLOSED else { return; }

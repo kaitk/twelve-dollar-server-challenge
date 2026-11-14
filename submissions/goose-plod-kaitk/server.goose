@@ -54,6 +54,9 @@ thread_fn checkpointer(box: http::Box) {
             sqlite::exec(db, "PRAGMA wal_checkpoint(PASSIVE)");
         };
         for e in ran { write_stderr(str("SQLite checkpoint: ", e.message, "\n")); }
+        // A hold's checkpoint: wake the write that asked, which ends it.
+        var to = http::MailAddress { .. };
+        if tag == HOLD && http::mail_value(bytes, to) { http::mail_send(to, 0, ""); }
     };
     sqlite::close(db);
 }
@@ -69,14 +72,15 @@ thread_fn worker(cfg: http::Config, checkpoints: http::Lane) {
         // is checked in its INSERT, so enforcement would only add seeks.
         db.db = sqlite::open(database(), sqlite::READ_WRITE | sqlite::NO_MUTEX | OPEN_URI, false);
         // WAL, as the seed is; NORMAL syncs at checkpoints, not at each
-        // commit, which SPEC.md's rule 6 allows. The lane copies most of the
-        // WAL back; at 16,000 pages this connection checkpoints the rest
-        // itself, which lets the next write start the WAL from its beginning.
+        // commit, which SPEC.md's rule 6 allows. The lane copies the WAL
+        // back, and a hold's checkpoint completes it (app.goose's held), so
+        // that the next COMMIT starts the WAL over. This connection
+        // checkpoints itself only at 65,536 pages, when holds can't keep up.
         sqlite::exec(db.db, """
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -16000;
-            PRAGMA wal_autocheckpoint = 16000;
+            PRAGMA wal_autocheckpoint = 65536;
             """);
         sqlite::busy_timeout(db.db, 5000);
     };
@@ -110,9 +114,10 @@ fn main() {
         guard ok else { abort("PORT: not a port"); }
         cfg.port = p as i32;
     }
-    // Two slots: one checkpoint running and one asked for; an ask past them
-    // is dropped, as the one queued will copy its frames.
-    let checkpoints = http::lane_open(http::LaneConfig { slots: 2, .. }, checkpointer);
+    // A checkpoint running, one asked for, and room for a hold's; a
+    // periodic ask past them is dropped, as the one queued will copy its
+    // frames.
+    let checkpoints = http::lane_open(http::LaneConfig { slots: 4, .. }, checkpointer);
     http::run(cfg, checkpoints, worker);
     http::lane_stop(checkpoints);
 }
