@@ -3,9 +3,9 @@
 // that checkpoints the WAL beside it.
 import std;
 import os;
-import http from "github.com/kaitk/goose-http@v0.5.19";
+import http from "github.com/kaitk/goose-http@v0.5.20";
 import hash from "github.com/kaitk/goose-hash@v0.0.4";
-import plod from "github.com/kaitk/plod@v0.5.12";
+import plod from "github.com/kaitk/plod@group-commit";
 import sqlite from "github.com/kaitk/goose-sqlite@v0.0.4";
 import app;
 
@@ -98,8 +98,12 @@ fn main() {
     // connection with data in a pass takes a receive buffer: past the ring's
     // buffers, the rest end their receives and are queued again, pass after
     // pass, so there are 1,024 buffers rather than goose-http's 64.
+    // A write waits for its pass's COMMIT as goose-http's waits do, which
+    // needs a box: a worker's wakes of its own exchanges take no slot, and
+    // each waiting write takes one of max_waiting's timers.
     var cfg = http::Config { workers: 1, max_conns: 1000000, idle_ms: 120000, server: "",
-                             ring_direct: true, ring_batch_us: 1000, ring_buffers: 1024, .. };
+                             ring_direct: true, ring_batch_us: 1000, ring_buffers: 1024,
+                             mail_slots: 64, max_waiting: 65536, .. };
     if env("HOST", host) && host != "0.0.0.0" { format(cfg.address, host); }
     if env("PORT", port) {
         let p, ok = parse_int(trim(port));
